@@ -1,0 +1,16 @@
+{
+  "name": "galactic-orbit-agent",
+  "version": "1.0.0",
+  "description": "AIBTC Galactic Orbit — heartbeat and news signals",
+  "main": "heartbeat.js",
+  "scripts": {
+    "heartbeat": "node heartbeat.js"
+  },
+  "dependencies": {
+    "@aibtc/mcp-server": "latest"
+  },
+  "devDependencies": {
+    "libsodium-wrappers": "^0.8.2",
+    "tweetnacl": "^1.0.3"
+  }
+}
