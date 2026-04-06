@@ -173,7 +173,13 @@ async function main() {
     const signalText = signalRaw.content?.[0]?.text ?? '{}';
     const signal = safeJson(signalText);
 
-    if (signalText.startsWith('Error:')) throw new Error(signalText);
+    if (signalText.startsWith('Error:')) {
+      if (signalText.includes('429') || signalText.includes('Cooldown') || signalText.includes('cooldown')) {
+        log(`[${timestamp}] Cooldown active — ${signalText.slice(0, 120)}`);
+        return;
+      }
+      throw new Error(signalText);
+    }
 
     if (signal.success) {
       log(`[${timestamp}] Signal filed: ${signal.signal?.id}`);
