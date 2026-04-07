@@ -1,202 +1,248 @@
 #!/usr/bin/env node
 // AIBTC News Signal — GitHub Actions CI
-// Imports wallet from CLIENT_MNEMONIC, searches arxiv, files signal on "security" beat
+// Signs requests natively (no MCP timeout risk), POSTs directly to aibtc.news API.
+// Uses MCP only for arxiv_search (fast, no auth, no timeout issues).
 
-const { spawn } = require('child_process');
-const path = require('path');
+'use strict';
+const bip39           = require('bip39');
+const { BIP32Factory } = require('bip32');
+const ecc             = require('tiny-secp256k1');
+const btcSigner       = require('@scure/btc-signer');
+const { hashSha256Sync } = require('@stacks/encryption');
+const { concatBytes }    = require('@stacks/common');
+const bitcoinMessage  = require('bitcoinjs-message');
+const { spawn }   = require('child_process');
+const https       = require('https');
+const path        = require('path');
 
-const BEAT_SLUG = 'security';
-const CI_WALLET_PASS = 'ci-news-agent-temp';
-const MCP_SERVER = path.join(__dirname, 'node_modules/@aibtc/mcp-server/dist/index.js');
+const BTC_ADDRESS = 'bc1q0vd9ukgcl4mkwnw2p4rvn4q3urdfyz2nukpgzt';
+const DERIVATION  = "m/84'/0'/0'/0/0";
+const BEAT_SLUG   = 'security';
+const NEWS_API    = 'https://aibtc.news';
+const MCP_SERVER  = path.join(__dirname, 'node_modules/@aibtc/mcp-server/dist/index.js');
 
 function log(msg) { console.log(msg); }
 
-function safeJson(text) {
-  try { return JSON.parse(text); } catch (_) { return {}; }
+// ---------------------------------------------------------------------------
+// BIP-322 signing — matches aibtc.news spec: sign "METHOD /path:unix_timestamp"
+// ---------------------------------------------------------------------------
+function doubleSha256(data) {
+  return hashSha256Sync(hashSha256Sync(data));
 }
 
+function bip322TaggedHash(message) {
+  const tagBytes = new TextEncoder().encode('BIP0322-signed-message');
+  const tagHash  = hashSha256Sync(tagBytes);
+  const msgBytes = new TextEncoder().encode(message);
+  return hashSha256Sync(concatBytes(tagHash, tagHash, msgBytes));
+}
+
+function encodeWitness(items) {
+  const parts = [];
+  const pushCompact = n => {
+    if (n < 0xfd) parts.push(new Uint8Array([n]));
+    else { const b = new Uint8Array(3); b[0]=0xfd; new DataView(b.buffer).setUint16(1,n,true); parts.push(b); }
+  };
+  pushCompact(items.length);
+  for (const item of items) { pushCompact(item.length); parts.push(item); }
+  const out = new Uint8Array(parts.reduce((s,p)=>s+p.length,0));
+  let off = 0; for (const p of parts) { out.set(p,off); off+=p.length; }
+  return out;
+}
+
+function bip322Sign(message, privateKey, scriptPubKey) {
+  const { RawTx, Transaction } = btcSigner;
+  const msgHash   = bip322TaggedHash(message);
+  const scriptSig = concatBytes(new Uint8Array([0x00, 0x20]), msgHash);
+  const rawTx = RawTx.encode({
+    version: 0,
+    inputs:  [{ txid: new Uint8Array(32), index: 0xffffffff, finalScriptSig: scriptSig, sequence: 0 }],
+    outputs: [{ amount: 0n, script: scriptPubKey }],
+    lockTime: 0,
+  });
+  const toSpendTxId = doubleSha256(rawTx).reverse();
+
+  const tx = new Transaction({ allowUnknownOutputs: true });
+  tx.addInput({ txid: toSpendTxId, index: 0, sequence: 0, witnessUtxo: { script: scriptPubKey, amount: 0n } });
+  tx.addOutput({ script: new Uint8Array([0x6a]), amount: 0n });
+  tx.signIdx(privateKey, 0);
+  tx.finalize();
+
+  const witness = tx.getInput(0).finalScriptWitness;
+  return Buffer.from(encodeWitness(witness)).toString('base64');
+}
+
+async function deriveKeys(mnemonic) {
+  const bip32 = BIP32Factory(ecc);
+  const seed  = await bip39.mnemonicToSeed(mnemonic);
+  const child = bip32.fromSeed(seed).derivePath(DERIVATION);
+  if (!child.privateKey) throw new Error('Cannot derive private key');
+  const pubKey     = new Uint8Array(child.publicKey);
+  const privKey    = new Uint8Array(child.privateKey);
+  const { script } = btcSigner.p2wpkh(pubKey, btcSigner.NETWORK);
+  return { privateKey: privKey, rawPrivateKey: child.privateKey, scriptPubKey: script };
+}
+
+// BIP-137 / bitcoinjs-message signing (segwit p2wpkh)
+function bip137Sign(message, rawPrivateKey) {
+  return bitcoinMessage.sign(message, rawPrivateKey, true, { segwitType: 'p2wpkh' }).toString('base64');
+}
+
+function buildAuthHeaders(method, apiPath, rawPrivateKey) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const message   = `${method} ${apiPath}:${timestamp}`;
+  const signature = bip137Sign(message, rawPrivateKey);
+  return {
+    'X-BTC-Address':   BTC_ADDRESS,
+    'X-BTC-Signature': signature,
+    'X-BTC-Timestamp': String(timestamp),
+    'Content-Type':    'application/json',
+    'User-Agent':      'galactic-orbit-agent/1.0',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+function httpsPost(url, headers, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const data   = JSON.stringify(body);
+    const req    = https.request({
+      hostname: parsed.hostname, path: parsed.pathname,
+      method: 'POST',
+      headers: { ...headers, 'Content-Length': Buffer.byteLength(data) },
+    }, res => {
+      let raw = ''; res.on('data', c => raw += c);
+      res.on('end', () => { try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); } catch (_) { resolve({ status: res.statusCode, body: raw }); } });
+    });
+    req.on('error', reject);
+    req.write(data); req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// arxiv via MCP (read-only, fast — only this uses MCP)
+// ---------------------------------------------------------------------------
 class McpClient {
-  constructor() {
-    this.proc = null;
-    this.buffer = '';
-    this.pending = new Map();
-    this.nextId = 1;
-  }
+  constructor() { this.proc=null; this.buffer=''; this.pending=new Map(); this.nextId=1; }
 
   start() {
     return new Promise((resolve, reject) => {
-      this.proc = spawn('node', [MCP_SERVER], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env }
-      });
-      this.proc.stdout.on('data', (data) => {
-        this.buffer += data.toString();
-        const lines = this.buffer.split('\n');
-        this.buffer = lines.pop();
+      this.proc = spawn('node', [MCP_SERVER], { stdio:['pipe','pipe','pipe'], env:{...process.env} });
+      this.proc.stdout.on('data', d => {
+        this.buffer += d.toString();
+        const lines = this.buffer.split('\n'); this.buffer = lines.pop();
         for (const line of lines) {
           if (!line.trim()) continue;
-          try {
-            const msg = JSON.parse(line);
-            if (msg.id != null && this.pending.has(msg.id)) {
-              const { resolve, reject } = this.pending.get(msg.id);
-              this.pending.delete(msg.id);
-              if (msg.error) reject(new Error(msg.error.message));
-              else resolve(msg.result);
-            }
-          } catch (_) {}
+          try { const m=JSON.parse(line); if (m.id!=null&&this.pending.has(m.id)) { const {resolve,reject}=this.pending.get(m.id); this.pending.delete(m.id); m.error?reject(new Error(m.error.message)):resolve(m.result); } } catch(_){}
         }
       });
-      this.proc.stderr.on('data', (d) => { const s = d.toString().trim(); if (s) process.stderr.write('[MCP] ' + s + '\n'); });
+      this.proc.stderr.on('data', d => { const s=d.toString().trim(); if(s) process.stderr.write('[MCP] '+s+'\n'); });
       this.proc.on('error', reject);
-      const id = this.nextId++;
-      this.pending.set(id, { resolve, reject });
-      this._write({ jsonrpc: '2.0', id, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'aibtc-news-ci', version: '1.0.0' } } });
-    }).then(r => { this._write({ jsonrpc: '2.0', method: 'notifications/initialized' }); return r; });
+      const id=this.nextId++;
+      this.pending.set(id,{resolve,reject});
+      this._write({jsonrpc:'2.0',id,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'aibtc-news-ci',version:'1.0'}}});
+    }).then(r=>{this._write({jsonrpc:'2.0',method:'notifications/initialized'});return r;});
   }
 
-  _write(msg) { this.proc.stdin.write(JSON.stringify(msg) + '\n'); }
+  _write(m) { this.proc.stdin.write(JSON.stringify(m)+'\n'); }
 
-  callTool(name, args = {}, timeoutMs = 30000) {
-    return new Promise((resolve, reject) => {
-      const id = this.nextId++;
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`MCP tool "${name}" timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.pending.set(id, {
-        resolve: (v) => { clearTimeout(timer); resolve(v); },
-        reject:  (e) => { clearTimeout(timer); reject(e); }
-      });
-      this._write({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
+  callTool(name, args={}, ms=20000) {
+    return new Promise((resolve,reject)=>{
+      const id=this.nextId++;
+      const t=setTimeout(()=>{this.pending.delete(id);reject(new Error(`MCP "${name}" timed out`));},ms);
+      this.pending.set(id,{resolve:v=>{clearTimeout(t);resolve(v);},reject:e=>{clearTimeout(t);reject(e);}});
+      this._write({jsonrpc:'2.0',id,method:'tools/call',params:{name,arguments:args}});
     });
   }
 
-  stop() { try { this.proc && this.proc.kill(); } catch (_) {} }
+  stop() { try{this.proc?.kill();}catch(_){} }
 }
 
-function pickBestPaper(papers, alreadyFiled) {
-  const keywords = ['bitcoin', 'crypto', 'agent', 'security', 'blockchain', 'wallet', 'llm', 'autonomous', 'attack', 'vulnerability'];
+// ---------------------------------------------------------------------------
+// Paper selection
+// ---------------------------------------------------------------------------
+const KEYWORDS = ['bitcoin','crypto','agent','security','blockchain','wallet','llm','autonomous','attack','vulnerability','mcp'];
+const FILED_IDS = (process.env.FILED_IDS||'').split(',').filter(Boolean);
+
+function pickBestPaper(papers) {
   return papers
-    .filter(p => !alreadyFiled.includes(p.id))
-    .map(p => {
-      const text = (p.title + ' ' + p.abstract + ' ' + (p.tags || []).join(' ')).toLowerCase();
-      const bonus = keywords.filter(k => text.includes(k)).length;
-      return { ...p, relevance: (p.score || 0) + bonus * 3 };
-    })
-    .sort((a, b) => b.relevance - a.relevance)[0] || null;
+    .filter(p => !FILED_IDS.includes(p.id))
+    .map(p => ({ ...p, relevance: (p.score||0) + KEYWORDS.filter(k=>(p.title+' '+p.abstract+' '+(p.tags||[]).join(' ')).toLowerCase().includes(k)).length*3 }))
+    .sort((a,b)=>b.relevance-a.relevance)[0] || null;
 }
 
-function buildHeadline(paper) {
-  const t = paper.title.replace(/\s+/g, ' ').trim();
-  return t.length <= 120 ? t : t.slice(0, 117) + '...';
-}
+function buildHeadline(p) { const t=p.title.replace(/\s+/g,' ').trim(); return t.length<=120?t:t.slice(0,117)+'...'; }
 
-function buildBody(paper) {
-  const abstract = paper.abstract.replace(/\s+/g, ' ').trim();
-  const sentences = abstract.match(/[^.!?]+[.!?]+/g) || [abstract];
-  let body = sentences.slice(0, 3).join(' ').trim();
-  if (body.length > 950) body = body.slice(0, 947) + '...';
-  return body;
+function buildBody(p) {
+  const s=p.abstract.replace(/\s+/g,' ').trim().match(/[^.!?]+[.!?]+/g)||[p.abstract];
+  const b=s.slice(0,3).join(' ').trim();
+  return b.length>950?b.slice(0,947)+'...':b;
 }
 
 function sanitizeTags(raw) {
-  return [...new Set(
-    raw.map(t => t.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, ''))
-       .filter(t => t.length >= 2 && t.length <= 30)
-  )].slice(0, 10);
+  return [...new Set(raw.map(t=>t.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'')).filter(t=>t.length>=2&&t.length<=30))].slice(0,10);
 }
 
-// Track filed paper IDs via env var (set by workflow between steps if needed)
-// In CI, each run is fresh so we just guard against same-run duplicates
-const FILED_IDS = (process.env.FILED_IDS || '').split(',').filter(Boolean);
-
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 async function main() {
-  const timestamp = new Date().toISOString();
-  log(`[${timestamp}] news-signal.js started`);
+  const ts = new Date().toISOString();
+  log(`[${ts}] news-signal started`);
 
   const mnemonic = process.env.CLIENT_MNEMONIC;
   if (!mnemonic) throw new Error('CLIENT_MNEMONIC not set');
 
-  const client = new McpClient();
+  const { rawPrivateKey } = await deriveKeys(mnemonic);
+  log(`[${ts}] Keys derived`);
+
+  // arxiv search via MCP
+  const mcp = new McpClient();
+  let papers = [];
   try {
-    await client.start();
-    log(`[${timestamp}] MCP server started`);
-
-    // Import wallet from mnemonic (CI runner is ephemeral — fresh each run)
-    const importRaw = await client.callTool('wallet_import', {
-      name: 'ci-agent',
-      mnemonic,
-      password: CI_WALLET_PASS
-    });
-    const importResult = safeJson(importRaw.content?.[0]?.text ?? '{}');
-    log(`[${timestamp}] Wallet import: ${importResult.success ? 'OK' : (importRaw.content?.[0]?.text || 'unknown')}`);
-
-    // Unlock wallet
-    const unlockRaw = await client.callTool('wallet_unlock', { password: CI_WALLET_PASS });
-    const unlock = safeJson(unlockRaw.content?.[0]?.text ?? '{}');
-    if (!unlock.success) throw new Error(`Wallet unlock failed: ${unlockRaw.content?.[0]?.text}`);
-    log(`[${timestamp}] Wallet unlocked: ${unlock['Bitcoin (L1)']?.['Native SegWit'] || 'OK'}`);
-
-    // Search arxiv
-    const searchRaw = await client.callTool('arxiv_search', {
-      query: 'AI agent security Bitcoin cryptocurrency vulnerability 2026'
-    });
-    const search = safeJson(searchRaw.content?.[0]?.text ?? '{}');
-    const papers = search.top_papers || [];
-    log(`[${timestamp}] arxiv: ${papers.length} papers found`);
-
-    if (!papers.length) {
-      log(`[${timestamp}] No papers found — skipping`);
-      return;
-    }
-
-    const paper = pickBestPaper(papers, FILED_IDS);
-    if (!paper) {
-      log(`[${timestamp}] All top papers already filed this session — skipping`);
-      return;
-    }
-    log(`[${timestamp}] Selected: ${paper.title}`);
-
-    const headline = buildHeadline(paper);
-    const body = buildBody(paper);
-    const tags = sanitizeTags(['security', 'agent', 'bitcoin', ...(paper.tags || [])]);
-
-    // File signal
-    const signalRaw = await client.callTool('news_file_signal', {
-      beat_slug: BEAT_SLUG,
-      headline,
-      body,
-      sources: [{ url: paper.abs_url, title: paper.title }],
-      tags,
-      disclosure: 'claude-sonnet-4-6, aibtc MCP tools, arxiv_search'
-    });
-    const signalText = signalRaw.content?.[0]?.text ?? '{}';
-    const signal = safeJson(signalText);
-
-    if (signalText.startsWith('Error:')) {
-      if (signalText.includes('429') || signalText.includes('Cooldown') || signalText.includes('cooldown')) {
-        log(`[${timestamp}] Cooldown active — ${signalText.slice(0, 120)}`);
-        return;
-      }
-      throw new Error(signalText);
-    }
-
-    if (signal.success) {
-      log(`[${timestamp}] Signal filed: ${signal.signal?.id}`);
-      log(`[${timestamp}] Headline: ${headline}`);
-      log(`[${timestamp}] Source: ${paper.abs_url}`);
-      log(`[${timestamp}] Status: submitted`);
-    } else {
-      // 429 cooldown is not fatal
-      const err = safeJson(signalText);
-      if (err.error && err.error.includes('Cooldown')) {
-        log(`[${timestamp}] Cooldown active — ${err.error}`);
-      } else {
-        throw new Error(`Failed to file signal: ${signalText}`);
-      }
-    }
+    await mcp.start();
+    const raw    = await mcp.callTool('arxiv_search', { query: 'AI agent security Bitcoin cryptocurrency vulnerability 2026' });
+    papers = JSON.parse(raw.content?.[0]?.text ?? '{}').top_papers || [];
+    log(`[${ts}] arxiv: ${papers.length} papers`);
   } finally {
-    client.stop();
+    mcp.stop();
+  }
+
+  if (!papers.length) { log(`[${ts}] No papers — skipping`); return; }
+
+  const paper = pickBestPaper(papers);
+  if (!paper) { log(`[${ts}] All top papers already filed — skipping`); return; }
+  log(`[${ts}] Selected: ${paper.title}`);
+  log(`[${ts}] Source: ${paper.abs_url}`);
+
+  const apiPath = '/api/signals';
+  const payload = {
+    beat_slug:   BEAT_SLUG,
+    btc_address: BTC_ADDRESS,
+    headline:    buildHeadline(paper),
+    body:        buildBody(paper),
+    sources:     [{ url: paper.abs_url, title: paper.title }],
+    tags:        sanitizeTags(['security','agent','bitcoin',...(paper.tags||[])]),
+    disclosure:  'claude-sonnet-4-6, arxiv_search, direct-api',
+  };
+
+  const headers = buildAuthHeaders('POST', apiPath, rawPrivateKey);
+  log(`[${ts}] POSTing to ${NEWS_API}${apiPath}`);
+
+  const res = await httpsPost(`${NEWS_API}${apiPath}`, headers, payload);
+  log(`[${ts}] HTTP ${res.status}: ${JSON.stringify(res.body).slice(0,200)}`);
+
+  if (res.status === 429) {
+    log(`[${ts}] Cooldown ${res.body?.cooldown?.waitMinutes ?? '?'} min — exiting OK`);
+    return;
+  }
+  if (res.status === 201 || res.status === 200) {
+    const id = res.body?.signal?.id || res.body?.id || 'unknown';
+    log(`[${ts}] Filed signal: ${id} — "${payload.headline}"`);
+  } else {
+    throw new Error(`HTTP ${res.status}: ${JSON.stringify(res.body)}`);
   }
 }
 
