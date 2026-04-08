@@ -9,15 +9,31 @@ const ecc              = require('tiny-secp256k1');
 const bitcoinMessage   = require('bitcoinjs-message');
 const https            = require('https');
 const http             = require('http');
+const fs               = require('fs');
+const path             = require('path');
 
-const BTC_ADDRESS = 'bc1q0vd9ukgcl4mkwnw2p4rvn4q3urdfyz2nukpgzt';
-const DERIVATION  = "m/84'/0'/0'/0/0";
-const BEAT_SLUG   = 'agent-economy';
-const NEWS_API    = 'https://aibtc.news';
-const ARXIV_API   = 'https://export.arxiv.org/api/query';
-const KEYWORDS    = ['bitcoin','crypto','agent','security','blockchain','wallet','llm','autonomous','attack','vulnerability','mcp','exploit'];
+const BTC_ADDRESS  = 'bc1q0vd9ukgcl4mkwnw2p4rvn4q3urdfyz2nukpgzt';
+const DERIVATION   = "m/84'/0'/0'/0/0";
+const BEAT_SLUG    = 'agent-economy';
+const NEWS_API     = 'https://aibtc.news';
+const ARXIV_API    = 'https://export.arxiv.org/api/query';
+const KEYWORDS     = ['bitcoin','crypto','agent','security','blockchain','wallet','llm','autonomous','attack','vulnerability','mcp','exploit'];
+const FILED_IDS_FILE = path.join(__dirname, 'filed-ids.txt');
 
 function log(msg) { console.log(msg); }
+
+// Load previously filed paper IDs from file + env var
+function loadFiledIds() {
+  const fromEnv = (process.env.FILED_IDS || '').split(',').filter(Boolean);
+  let fromFile = [];
+  try { fromFile = fs.readFileSync(FILED_IDS_FILE, 'utf8').split('\n').map(s => s.trim()).filter(Boolean); } catch (_) {}
+  return new Set([...fromEnv, ...fromFile]);
+}
+
+// Append a newly filed paper ID to the file (workflow will commit it)
+function recordFiledId(id) {
+  fs.appendFileSync(FILED_IDS_FILE, id + '\n');
+}
 
 async function deriveKey(mnemonic) {
   const bip32 = BIP32Factory(ecc);
@@ -70,7 +86,7 @@ function parseAtomPapers(xml) {
   const entries = xml.match(/<entry>([\s\S]*?)<\/entry>/g) || [];
   for (const entry of entries) {
     const get  = tag => { const m = entry.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`)); return m ? m[1].replace(/<[^>]+>/g,'').trim() : ''; };
-    const idUrl = get('id');
+    const idUrl   = get('id');
     const arxivId = idUrl.split('/abs/').pop().replace(/v\d+$/, '');
     papers.push({
       id:        arxivId,
@@ -89,11 +105,9 @@ async function searchArxiv(query) {
   return parseAtomPapers(xml);
 }
 
-const FILED_IDS = (process.env.FILED_IDS || '').split(',').filter(Boolean);
-
-function pickBestPaper(papers) {
+function pickBestPaper(papers, filedIds) {
   return papers
-    .filter(p => p.id && !FILED_IDS.includes(p.id) && p.title && p.abstract)
+    .filter(p => p.id && !filedIds.has(p.id) && p.title && p.abstract)
     .map(p => ({ ...p, rel: KEYWORDS.filter(k => (p.title+' '+p.abstract).toLowerCase().includes(k)).length }))
     .filter(p => p.rel > 0)
     .sort((a, b) => b.rel - a.rel)[0] || null;
@@ -118,16 +132,19 @@ async function main() {
   const mnemonic = process.env.CLIENT_MNEMONIC;
   if (!mnemonic) throw new Error('CLIENT_MNEMONIC not set');
 
+  const filedIds = loadFiledIds();
+  log(`[${ts}] Known filed IDs: ${filedIds.size}`);
+
   const privateKey = await deriveKey(mnemonic);
   log(`[${ts}] Keys derived`);
 
-  const papers = await searchArxiv('AI agent security Bitcoin cryptocurrency vulnerability attack');
+  const papers = await searchArxiv('AI agent Bitcoin crypto autonomous economy payments MCP blockchain');
   log(`[${ts}] arxiv: ${papers.length} papers`);
 
   if (!papers.length) { log(`[${ts}] No papers — skipping`); return; }
 
-  const paper = pickBestPaper(papers);
-  if (!paper) { log(`[${ts}] No relevant papers — skipping`); return; }
+  const paper = pickBestPaper(papers, filedIds);
+  if (!paper) { log(`[${ts}] All relevant papers already filed — skipping`); return; }
   log(`[${ts}] Selected (rel=${paper.rel}): ${paper.title}`);
   log(`[${ts}] Source: ${paper.abs_url}`);
 
@@ -153,7 +170,10 @@ async function main() {
     return;
   }
   if (res.status === 201 || res.status === 200) {
-    log(`[${ts}] Filed: ${res.body?.signal?.id || 'unknown'} — "${payload.headline}"`);
+    const signalId = res.body?.signal?.id || 'unknown';
+    log(`[${ts}] Filed: ${signalId} — "${payload.headline}"`);
+    recordFiledId(paper.id);
+    log(`[${ts}] Recorded ${paper.id} in filed-ids.txt`);
   } else {
     throw new Error(`HTTP ${res.status}: ${JSON.stringify(res.body)}`);
   }
