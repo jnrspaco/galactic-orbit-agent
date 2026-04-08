@@ -12,7 +12,7 @@ const http             = require('http');
 
 const BTC_ADDRESS = 'bc1q0vd9ukgcl4mkwnw2p4rvn4q3urdfyz2nukpgzt';
 const DERIVATION  = "m/84'/0'/0'/0/0";
-const BEAT_SLUG   = 'security';
+const BEAT_SLUG   = 'agent-economy';
 const NEWS_API    = 'https://aibtc.news';
 const ARXIV_API   = 'https://export.arxiv.org/api/query';
 const KEYWORDS    = ['bitcoin','crypto','agent','security','blockchain','wallet','llm','autonomous','attack','vulnerability','mcp','exploit'];
@@ -138,7 +138,7 @@ async function main() {
     headline:    buildHeadline(paper),
     body:        buildBody(paper),
     sources:     [{ url: paper.abs_url, title: paper.title }],
-    tags:        sanitizeTags(['security','agent','bitcoin','llm','attack']),
+    tags:        sanitizeTags(['agent','bitcoin','llm','autonomous','economy','payments']),
     disclosure:  'claude-sonnet-4-6, arxiv-direct, direct-api',
   };
 

@@ -2,9 +2,11 @@ name: AIBTC News Signal
 
 on:
   schedule:
-    - cron: '7 6 * * *'    # 06:07 UTC — morning
-    - cron: '11 13 * * *'  # 13:11 UTC — afternoon
-    - cron: '3 20 * * *'   # 20:03 UTC — evening
+    - cron: '0 3 * * *'    # 03:00 UTC
+    - cron: '0 7 * * *'    # 07:00 UTC
+    - cron: '0 11 * * *'   # 11:00 UTC
+    - cron: '0 15 * * *'   # 15:00 UTC
+    - cron: '0 19 * * *'   # 19:00 UTC
   workflow_dispatch:         # allow manual trigger
 
 jobs:
